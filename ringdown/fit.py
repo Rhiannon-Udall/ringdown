@@ -1,9 +1,18 @@
 """Module defining the core :class:`Fit` class.
 """
 
-__all__ = ['Target', 'Fit', 'MODELS']
+__all__ = ["Target", "Fit", "MODELS"]
 
 from pylab import *
+
+import jax
+import jax.numpy as jnp
+from flowMC.sampler.Sampler import Sampler
+from flowMC.sampler.MALA import MALA
+from flowMC.nfmodel.rqSpline import MaskedCouplingRQSpline
+from flowMC.utils.PRNG_keys import initialize_rng_keys
+from flowMC.utils.EvolutionaryOptimizer import EvolutionaryOptimizer
+from jaxtyping import ArrayLike, Array
 
 import arviz as az
 import json
@@ -22,6 +31,7 @@ from . import qnms
 import warnings
 from . import waveforms
 
+
 def np2(x):
     """Returns the next power of two as big as or larger than x."""
     p = 1
@@ -29,12 +39,14 @@ def np2(x):
         p = p << 1
     return p
 
-Target = namedtuple('Target', ['t0', 'ra', 'dec', 'psi'])
 
-MODELS = ('ftau', 'mchi', 'mchi_aligned', 'mchi_marginal', 'mchiq')
+Target = namedtuple("Target", ["t0", "ra", "dec", "psi"])
+
+MODELS = ("ftau", "mchi", "mchi_aligned", "mchi_marginal", "mchiq")
+
 
 class Fit(object):
-    """ A ringdown fit. Contains all the information required to setup and run
+    """A ringdown fit. Contains all the information required to setup and run
     a ringdown inference analysis, as well as to manipulate the result.
 
     Example usage::
@@ -91,11 +103,13 @@ class Fit(object):
         or conditioning options), stored as dictionary of dictionaries whose
         outer (inner) keys will be interpreted as sections (options) when
         creating a configuration file through :meth:`Fit.to_config`.
+    flowmc : bool, optional
+        Whether to use flowmc for the fit - if False continue using pymc instead
     """
 
     _compiled_models = {}
 
-    def __init__(self, model='mchi', modes=None, **kws):
+    def __init__(self, model="mchi", modes=None, flowmc=False, **kws):
         self.info = {}
         self.data = {}
         self.injections = {}
@@ -106,8 +120,7 @@ class Fit(object):
         if model.lower() in MODELS:
             self.model = model.lower()
         else:
-            raise ValueError('invalid model {:s}; options are {}'.format(model,
-                                                                         MODELS))
+            raise ValueError("invalid model {:s}; options are {}".format(model, MODELS))
         self.result = None
         self.prior = None
         self._duration = None
@@ -119,44 +132,53 @@ class Fit(object):
         # assume rest of kwargs are to be passed to stan_data (e.g. prior)
         self._prior_settings = kws
         self._pymc_model = None
+        self._flowmc_model = None
+        self.flowmc = flowmc
+
+    @property
+    def flowmc(self) -> bool:
+        """Whether this fit should be done via flowmc"""
+        return self._flowmc
+
+    @flowmc.setter
+    def flowmc(self, flowmc: bool) -> None:
+        self._flowmc = flowmc
 
     @property
     def n_modes(self) -> int:
-        """ Number of damped sinusoids to be included in template.
-        """
+        """Number of damped sinusoids to be included in template."""
         return self._n_modes or len(self.modes)
 
     @property
     def _model(self):
         if self.model is None:
-            raise ValueError('you must specify a model')
+            raise ValueError("you must specify a model")
         elif self.model not in self._compiled_models:
             if self.model in MODELS:
                 self.compile()
             else:
-                raise ValueError('unrecognized model %r' % self.model)
+                raise ValueError("unrecognized model %r" % self.model)
         return self._compiled_models[self.model]
-    
+
     @property
     def injection_parameters(self) -> dict:
-        return self.info.get('injection', {})
+        return self.info.get("injection", {})
 
     @property
     def ifos(self) -> list:
-        """ Instruments to be analyzed.
-        """
+        """Instruments to be analyzed."""
         return list(self.data.keys())
 
     @property
     def t0(self) -> float:
-        """ Target truncation time (defined at geocenter if model accepts
+        """Target truncation time (defined at geocenter if model accepts
         multiple detectors).
         """
         return self.target.t0
 
     @property
     def sky(self) -> tuple:
-        """ Tuple of source right ascension, declination and polarization angle
+        """Tuple of source right ascension, declination and polarization angle
         (all in radians). This can be set using
         :meth:`Fit.set_target`.
         """
@@ -187,98 +209,107 @@ class Fit(object):
         data = {}
         i0s = self.start_indices
         for i, d in self.data.items():
-            data[i] = d.iloc[i0s[i]:i0s[i] + self.n_analyze]
+            data[i] = d.iloc[i0s[i] : i0s[i] + self.n_analyze]
         return data
 
     @property
     def _default_prior(self):
-        default = {'A_scale': None}
-        if self.model == 'ftau':
+        default = {"A_scale": None}
+        if self.model == "ftau":
             # TODO: set default priors based on sampling rate and duration
-            default.update(dict(
-                f_max=None,
-                f_min=None,
-                gamma_max=None,
-                gamma_min=None,
-                prior_run=False
-            ))
-        elif self.model == 'mchi':
-            default.update(dict(
-                perturb_f=zeros(self.n_modes or 1),
-                perturb_tau=zeros(self.n_modes or 1),
-                df_min=-0.5,
-                dtau_min=-0.5,
-                df_max=0.5,
-                dtau_max=0.5,
-                M_min=None,
-                M_max=None,
-                chi_min=0,
-                chi_max=0.99,
-                flat_A=0,
-                flat_A_ellip=0,
-                f_min=0.0,
-                f_max=np.inf,
-                prior_run=False
-            ))
-        elif self.model == 'mchi_marginal':
-            del default['A_scale']
-            default.update(dict(
-                A_scale_max=None,
-                perturb_f=zeros(self.n_modes or 1),
-                perturb_tau=zeros(self.n_modes or 1),
-                df_min=-0.5,
-                dtau_min=-0.5,
-                df_max=0.5,
-                dtau_max=0.5,
-                M_min=None,
-                M_max=None,
-                chi_min=0,
-                chi_max=0.99,
-                f_min=0.0,
-                f_max=np.inf,
-                prior_run=False
-            ))
-        elif self.model == 'mchi_aligned':
-            default.update(dict(
-                perturb_f=zeros(self.n_modes or 1),
-                perturb_tau=zeros(self.n_modes or 1),
-                df_min=-0.5,
-                dtau_min=-0.5,
-                df_max=0.5,
-                dtau_max=0.5,
-                M_min=None,
-                M_max=None,
-                chi_min=0,
-                chi_max=0.99,
-                cosi_min=-1,
-                cosi_max=1,
-                flat_A=0,
-                f_min=0.0,
-                f_max=np.inf,
-                prior_run=False
-            ))
-        elif self.model == 'mchiq':
-             default.update(dict(
-                 M_min=None,
-                 M_max=None,
-                 r2_qchi_min=0.0,
-                 r2_qchi_max=1.0,
-                 theta_qchi_min=0.0,
-                 theta_qchi_max=pi/2,
-                 df_coeffs=[],
-                 dg_coeffs=[],
-                 flat_A=0,
-                 flat_A_ellip=0,
-                 f_min=0.0,
-                 f_max=np.inf,
-                 prior_run=False
-             ))
+            default.update(
+                dict(
+                    f_max=None,
+                    f_min=None,
+                    gamma_max=None,
+                    gamma_min=None,
+                    prior_run=False,
+                )
+            )
+        elif self.model == "mchi":
+            default.update(
+                dict(
+                    perturb_f=zeros(self.n_modes or 1),
+                    perturb_tau=zeros(self.n_modes or 1),
+                    df_min=-0.5,
+                    dtau_min=-0.5,
+                    df_max=0.5,
+                    dtau_max=0.5,
+                    M_min=None,
+                    M_max=None,
+                    chi_min=0,
+                    chi_max=0.99,
+                    flat_A=0,
+                    flat_A_ellip=0,
+                    f_min=0.0,
+                    f_max=np.inf,
+                    prior_run=False,
+                )
+            )
+        elif self.model == "mchi_marginal":
+            del default["A_scale"]
+            default.update(
+                dict(
+                    A_scale_max=None,
+                    perturb_f=zeros(self.n_modes or 1),
+                    perturb_tau=zeros(self.n_modes or 1),
+                    df_min=-0.5,
+                    dtau_min=-0.5,
+                    df_max=0.5,
+                    dtau_max=0.5,
+                    M_min=None,
+                    M_max=None,
+                    chi_min=0,
+                    chi_max=0.99,
+                    f_min=0.0,
+                    f_max=np.inf,
+                    prior_run=False,
+                )
+            )
+        elif self.model == "mchi_aligned":
+            default.update(
+                dict(
+                    perturb_f=zeros(self.n_modes or 1),
+                    perturb_tau=zeros(self.n_modes or 1),
+                    df_min=-0.5,
+                    dtau_min=-0.5,
+                    df_max=0.5,
+                    dtau_max=0.5,
+                    M_min=None,
+                    M_max=None,
+                    chi_min=0,
+                    chi_max=0.99,
+                    cosi_min=-1,
+                    cosi_max=1,
+                    flat_A=0,
+                    f_min=0.0,
+                    f_max=np.inf,
+                    prior_run=False,
+                )
+            )
+        elif self.model == "mchiq":
+            default.update(
+                dict(
+                    M_min=None,
+                    M_max=None,
+                    r2_qchi_min=0.0,
+                    r2_qchi_max=1.0,
+                    theta_qchi_min=0.0,
+                    theta_qchi_max=pi / 2,
+                    df_coeffs=[],
+                    dg_coeffs=[],
+                    flat_A=0,
+                    flat_A_ellip=0,
+                    f_min=0.0,
+                    f_max=np.inf,
+                    prior_run=False,
+                )
+            )
         return default
 
     @property
     def prior_settings(self) -> dict:
-        """Prior options as currently set.
-        """
+        """Prior options as currently set."""
         prior = self._default_prior
         prior.update(self._prior_settings)
         return prior
@@ -308,8 +339,10 @@ class Fit(object):
                 i = valid_keys_low.index(k.lower())
                 self._prior_settings[valid_keys[i]] = v
             else:
-                raise ValueError('{} is not a valid model argument.'
-                                 'Valid options are: {}'.format(k, valid_keys))
+                raise ValueError(
+                    "{} is not a valid model argument."
+                    "Valid options are: {}".format(k, valid_keys)
+                )
         # reset model cache
         self._pymc_model = None
 
@@ -318,8 +351,7 @@ class Fit(object):
 
     @property
     def model_input(self) -> dict:
-        """Arguments to be passed to sampler.
-        """
+        """Arguments to be passed to sampler."""
         if not self.acfs:
             logging.warning("computing ACFs with default settings")
             self.compute_acfs()
@@ -327,66 +359,102 @@ class Fit(object):
         data_dict = self.analysis_data
 
         fpfc = self.antenna_patterns.values()
-        fp = [x[0] for x in fpfc]
-        fc = [x[1] for x in fpfc]
 
-        input = dict(
-            # data related quantities
-            nsamp=self.n_analyze,
-            nmode=self.n_modes,
-            nobs=len(data_dict),
-            t0=list(self.start_times.values()),
-            times=[array(d.time) for d in data_dict.values()],
-            strains=[s.values for s in data_dict.values()],
-            Ls=[a.iloc[:self.n_analyze].cholesky for a in self.acfs.values()],
-            Fps = fp,
-            Fcs = fc
-        )
+        if self.flowmc:
+            fp = jnp.array([x[0] for x in fpfc])
+            fc = jnp.array([x[1] for x in fpfc])
+
+            input = dict(
+                # data related quantities
+                nsamp=self.n_analyze,
+                nmode=self.n_modes,
+                nobs=len(data_dict),
+                t0=jnp.array(list(self.start_times.values())),
+                times=jnp.array([d.time for d in data_dict.values()]),
+                strains=jnp.array([s.values for s in data_dict.values()]),
+                Ls=jnp.array(
+                    [a.iloc[: self.n_analyze].cholesky for a in self.acfs.values()]
+                ),
+                Fps=fp,
+                Fcs=fc,
+            )
+        else:
+            fp = [x[0] for x in fpfc]
+            fc = [x[1] for x in fpfc]
+
+            input = dict(
+                # data related quantities
+                nsamp=self.n_analyze,
+                nmode=self.n_modes,
+                nobs=len(data_dict),
+                t0=list(self.start_times.values()),
+                times=[array(d.time) for d in data_dict.values()],
+                strains=[s.values for s in data_dict.values()],
+                Ls=[a.iloc[: self.n_analyze].cholesky for a in self.acfs.values()],
+                Fps=fp,
+                Fcs=fc,
+            )
 
         # IFO coordinate names must be bytestrings in order to serialize and
         # compress properly.
-        input['ifos'] = [bytes(str(i), 'utf-8') for i in self.ifos]
+        input["ifos"] = [bytes(str(i), "utf-8") for i in self.ifos]
 
-        if 'mchi' in self.model:
+        if "mchi" in self.model:
             if self.modes is None:
                 raise RuntimeError("fit has no modes (see fit.set_modes)")
             f_coeff, g_coeff = self.spectral_coefficients
-            input.update(dict(
-                f_coeffs=f_coeff,
-                g_coeffs=g_coeff,
-            ))
+            input.update(
+                dict(
+                    f_coeffs=f_coeff,
+                    g_coeffs=g_coeff,
+                )
+            )
 
             # Mode coordinate names must also be bytestrings in order to
             # serialize and compress properly
-            input['modes'] = [bytes(f'{m.p}{m.l}{m.m}{m.n}', 'utf-8') for m in
-                              self.modes]
+            input["modes"] = [
+                bytes(f"{m.p}{m.l}{m.m}{m.n}", "utf-8") for m in self.modes
+            ]
 
         input.update(self.prior_settings)
 
         for k, v in input.items():
             if v is None:
-                raise ValueError('please specify {}'.format(k))
+                raise ValueError("please specify {}".format(k))
         return input
 
     @property
     def pymc_model(self):
         if self._pymc_model is None:
-            if self.model == 'mchi':
+            if self.model == "mchi":
                 self._pymc_model = model.make_mchi_model(**self.model_input)
-            elif self.model == 'mchi_marginal':
-                self._pymc_model = model.make_mchi_marginalized_model(**self.model_input)
-            elif self.model == 'mchi_aligned':
+            elif self.model == "mchi_marginal":
+                self._pymc_model = model.make_mchi_marginalized_model(
+                    **self.model_input
+                )
+            elif self.model == "mchi_aligned":
                 self._pymc_model = model.make_mchi_aligned_model(**self.model_input)
-            elif self.model == 'ftau':
+            elif self.model == "ftau":
                 self._pymc_model = model.make_ftau_model(**self.model_input)
             else:
-                raise NotImplementedError(f'unrecognized model {self.model}')
+                raise NotImplementedError(f"unrecognized model {self.model}")
         return self._pymc_model
 
+    @property
+    def flowmc_model(self):
+        if self._flowmc_model is None:
+            if self.model == "mchi":
+                self._flowmc_model = model.jax_make_mchi_model(**self.model_input)
+            else:
+                raise ValueError(
+                    "Only mchi has been implemented with flowmc at present"
+                )
+        return self._flowmc_model
+
     @classmethod
-    def from_config(cls, config_input,no_cond=False):
+    def from_config(cls, config_input, no_cond=False):
         """Creates a :class:`Fit` instance from a configuration file.
-        
+
         Has the ability to load and condition data, as well as to inject a
         simulated signal and to compute or load ACFs. Does not run the fit
         automatically.
@@ -412,69 +480,76 @@ class Fit(object):
                 raise FileNotFoundError(config_input)
             config = configparser.ConfigParser()
             config.read(config_input)
+
         # utility function to parse arguments
         def try_parse(x):
             try:
                 return float(x)
-            except (TypeError,ValueError):
+            except (TypeError, ValueError):
                 try:
                     return literal_eval(x)
-                except (TypeError,ValueError,SyntaxError):
+                except (TypeError, ValueError, SyntaxError):
                     if x == "inf":
                         return np.inf
                     else:
                         return x
-                    
+
         # create fit object
-        fit = cls(config['model']['name'], modes=config['model']['modes'])
+        fit = cls(config["model"]["name"], modes=config["model"]["modes"])
         # add priors
-        prior = config['prior']
-        fit.update_prior(**{k: try_parse(v) for k,v in prior.items()
-                             if "drift" not in k})
-        if 'data' not in config:
+        prior = config["prior"]
+        fit.update_prior(
+            **{k: try_parse(v) for k, v in prior.items() if "drift" not in k}
+        )
+        if "data" not in config:
             # the rest of the options require loading data, so if no pointer to
             # data was provided, just exit
             return fit
         # load data
-        ifo_input = config.get('data', 'ifos', fallback='')
+        ifo_input = config.get("data", "ifos", fallback="")
         try:
             ifos = literal_eval(ifo_input)
-        except (ValueError,SyntaxError):
-            ifos = [i.strip() for i in ifo_input.split(',')]
-        path_input = config['data']['path']
+        except (ValueError, SyntaxError):
+            ifos = [i.strip() for i in ifo_input.split(",")]
+        path_input = config["data"]["path"]
         # NOTE: not popping in order to preserve original ConfigParser
-        kws = {k: try_parse(v) for k,v in config['data'].items()
-                  if k not in ['ifos', 'path']}
+        kws = {
+            k: try_parse(v)
+            for k, v in config["data"].items()
+            if k not in ["ifos", "path"]
+        }
         fit.load_data(path_input, ifos, **kws)
         # add target
-        fit.set_target(**{k: try_parse(v) for k,v in config['target'].items()})
+        fit.set_target(**{k: try_parse(v) for k, v in config["target"].items()})
         # inject signal if requested
-        if config.has_section('injection'):
-            inj_kws = {k: try_parse(v) for k,v in config['injection'].items()}
-            if 'path' in inj_kws:
+        if config.has_section("injection"):
+            inj_kws = {k: try_parse(v) for k, v in config["injection"].items()}
+            if "path" in inj_kws:
                 # attempt to read injection parameters from JSON file
-                injpath = os.path.abspath(inj_kws.pop('path'))
+                injpath = os.path.abspath(inj_kws.pop("path"))
                 try:
-                    with open(injpath, 'r') as f:
+                    with open(injpath, "r") as f:
                         json_kws = json.load(f)
                     # check if there's an overlap between JSON and INI
                     overlap = set(json_kws.keys()).intersection(inj_kws.keys())
                     if overlap:
-                        logging.warn("overwriting injection file options "
-                                     f"with config: {overlap}")
+                        logging.warn(
+                            "overwriting injection file options "
+                            f"with config: {overlap}"
+                        )
                     # merge injection settings from JSON and INI
                     # NOTE: config file overwrites JSON!
                     json_kws.update(inj_kws)
                     inj_kws = json_kws
-                except (UnicodeDecodeError,json.JSONDecodeError):
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     raise IOError(f"unable to read JSON file: {injpath}")
-            no_noise = inj_kws.get('no_noise', False)
-            post_cond = inj_kws.get('post_cond', False)
+            no_noise = inj_kws.get("no_noise", False)
+            post_cond = inj_kws.get("post_cond", False)
             if no_noise:
                 # create injection but do not add it to data quite yet, in case
                 # we need to estimate ACFs from data first
                 fit.injections = fit.get_templates(**inj_kws)
-                fit.update_info('injection', **inj_kws)
+                fit.update_info("injection", **inj_kws)
             elif not post_cond:
                 # unless we have to wait after conditioning (post_cond) inject
                 # signal into data now
@@ -484,17 +559,18 @@ class Fit(object):
             no_noise = False
             post_cond = False
         # condition data if requested
-        if config.has_section('condition') and not no_cond:
-            cond_kws = {k: try_parse(v) for k,v in config['condition'].items()}
+        if config.has_section("condition") and not no_cond:
+            cond_kws = {k: try_parse(v) for k, v in config["condition"].items()}
             fit.condition_data(**cond_kws)
         # load or produce ACFs
-        if config.get('acf', 'path', fallback=False):
-            kws = {k: try_parse(v) for k,v in config['acf'].items()
-                   if k not in ['path']}
-            fit.load_acfs(config['acf']['path'], **kws)
+        if config.get("acf", "path", fallback=False):
+            kws = {
+                k: try_parse(v) for k, v in config["acf"].items() if k not in ["path"]
+            }
+            fit.load_acfs(config["acf"]["path"], **kws)
         else:
-            acf_kws = {} if 'acf' not in config else config['acf']
-            fit.compute_acfs(**{k: try_parse(v) for k,v in acf_kws.items()})
+            acf_kws = {} if "acf" not in config else config["acf"]
+            fit.compute_acfs(**{k: try_parse(v) for k, v in acf_kws.items()})
         if no_noise:
             # no-noise injection, so replace data by simulated signal
             if post_cond:
@@ -504,16 +580,16 @@ class Fit(object):
                 # fit.inject(), thus adding the injection to a bunch of zeros
                 # while guaranteeing that the injection gets produced on the
                 # right time array
-                fit.data = {i: 0*v for i,v in fit.data.items()}
+                fit.data = {i: 0 * v for i, v in fit.data.items()}
                 fit.inject(**inj_kws)
             else:
                 # the injection must be conditioned, so replace the data with
                 # the injection and condition it explicitly
                 fit.data = fit.injections
-                if config.has_section('condition') and not post_cond:
+                if config.has_section("condition") and not post_cond:
                     fit.condition_data(preserve_acfs=True, **cond_kws)
         elif post_cond:
-            # now that we are done conditioning, inject the requested signal 
+            # now that we are done conditioning, inject the requested signal
             fit.inject(**inj_kws)
         return fit
 
@@ -522,7 +598,7 @@ class Fit(object):
         :meth:`Fit.from_config`.
 
         .. note::
-            This will only result in a working configuration file if all 
+            This will only result in a working configuration file if all
             data provenance information is available in :attr:`Fit.info`.
             This field is automatically populated if the :meth:`Fit.load_data`
             method is used to add data to fit.
@@ -538,30 +614,32 @@ class Fit(object):
             configuration file object.
         """
         config = configparser.ConfigParser()
+
         # utility to format options in config
         def form_opt(x):
-            return array2string(array(x), separator=', ')
+            return array2string(array(x), separator=", ")
+
         # model options
-        config['model'] = {}
-        config['model']['name'] = self.model
+        config["model"] = {}
+        config["model"]["name"] = self.model
         if self.modes is None:
-            config['model']['modes'] = str(self.n_modes)
+            config["model"]["modes"] = str(self.n_modes)
         else:
-            config['model']['modes'] = str([tuple(m) for m in self.modes])
+            config["model"]["modes"] = str([tuple(m) for m in self.modes])
         # prior options
-        config['prior'] = {k:form_opt(v) for k,v in self.prior_settings.items()}
+        config["prior"] = {k: form_opt(v) for k, v in self.prior_settings.items()}
         # rest of options require data, so exit of none were added
         if not self.ifos:
             return config
         # data, injection, conditioning and acf options
         for sec, opts in self.info.items():
-            config[sec] = {k: form_opt(v) for k,v in self.info[sec].items()}
+            config[sec] = {k: form_opt(v) for k, v in self.info[sec].items()}
         # target options
-        config['target'] = {k: str(v) for k,v in self.target._asdict().items()}
-        config['target']['duration'] = str(self.duration)
+        config["target"] = {k: str(v) for k, v in self.target._asdict().items()}
+        config["target"]["duration"] = str(self.duration)
         # write file to disk if requested
         if path is not None:
-            with open(path, 'w') as f:
+            with open(path, "w") as f:
                 config.write(f)
         return config
 
@@ -577,14 +655,14 @@ class Fit(object):
             fit.update_info('data', path='path/to/{ifo}-data.h5')
 
         adds an entry to ``fit.info`` like::
-        
+
             {'data': {'path': 'path/to/{ifo}-data.h5')}}
 
         Arguments
         ---------
         section : str
             name of information category, e.g., `data`, `injection`,
-            `condition`. 
+            `condition`.
         """
         self.info[section] = self.info.get(section, {})
         self.info[section].update(**kws)
@@ -618,14 +696,15 @@ class Fit(object):
             new_data[k] = d.condition(t0=t0, **kwargs)
         self.data = new_data
         if not preserve_acfs:
-            self.acfs = {} # Just to be sure that these stay consistent
+            self.acfs = {}  # Just to be sure that these stay consistent
         elif self.acfs:
             logging.warning("preserving existing ACFs after conditioning")
         # record conditioning settings
-        self.update_info('condition', **kwargs)
+        self.update_info("condition", **kwargs)
+
     condition_data.__doc__ += Data.condition.__doc__
 
-    def get_templates(self, signal_buffer='auto', **kws):
+    def get_templates(self, signal_buffer="auto", **kws):
         """Produce templates at each detector for a given set of parameters.
         Can be used to generate waveforms from model samples, or a full
         coalescence.
@@ -645,27 +724,28 @@ class Fit(object):
             has no effect for coalescence signals)
         \*\*kws :
             arguments passed to :func:`ringdown.waveforms.get_detector_signals`.
-        
+
         Returns
         -------
         waveforms : dict
             dictionary of :class:`Data` waveforms for each detector.
         """
-        if signal_buffer == 'auto':
+        if signal_buffer == "auto":
             if self.duration is not None:
-                kws['signal_buffer'] = 10*self.duration
+                kws["signal_buffer"] = 10 * self.duration
         else:
-            kws['signal_buffer'] = signal_buffer
+            kws["signal_buffer"] = signal_buffer
 
         # if no sky location given, use provided APs or default to target
-        if not all([k in kws for k in ['ra', 'dec']]):
-            kws['antenna_patterns'] = kws.pop('antenna_patterns', None) or \
-                                      self.antenna_patterns
-        for k in ['ra', 'dec', 'psi']:
+        if not all([k in kws for k in ["ra", "dec"]]):
+            kws["antenna_patterns"] = (
+                kws.pop("antenna_patterns", None) or self.antenna_patterns
+            )
+        for k in ["ra", "dec", "psi"]:
             kws[k] = kws.get(k, self.target._asdict()[k])
 
-        kws['times'] = {ifo: d.time.values for ifo,d in self.data.items()}
-        kws['t0_default'] = self.t0
+        kws["times"] = {ifo: d.time.values for ifo, d in self.data.items()}
+        kws["t0_default"] = self.t0
         return waveforms.get_detector_signals(**kws)
 
     def inject(self, no_noise=False, **kws):
@@ -690,12 +770,85 @@ class Fit(object):
                 self.data[i] = h
             else:
                 self.data[i] = self.data[i] + h
-        self.update_info('injection', no_noise=no_noise, **kws)
+        self.update_info("injection", no_noise=no_noise, **kws)
 
-    DEF_RUN_KWS = dict(init='jitter+adapt_full', target_accept=0.9)
-    
-    def run(self, prior=False, suppress_warnings=True, store_residuals=True,
-            min_ess=None, **kws):
+    DEF_RUN_KWS = dict(init="jitter+adapt_full", target_accept=0.9)
+
+    @property
+    def flowmc_lower_bounds(self):
+        """Determine the lower bounds for the model"""
+        assert self.flowmc, "Cannot get lower bounds of flowmc model when using pymc"
+        nmodes = self.model_input["f_coeffs"].shape[0]
+        lower_bounds = []
+        lower_bounds.append(self.model_input["M_min"])
+        lower_bounds.append(self.model_input["chi_min"])
+        lower_bounds += (
+            [-10] * 4 * nmodes
+        )  # A unit minima, hopefully a sufficiently low number
+        # Will that always be true in flat A and flat A/ellip?
+        lower_bounds += [self.model_input["df_min"]] * nmodes
+        lower_bounds += [self.model_input["dtau_min"]] * nmodes
+        lower_bounds = jnp.array(lower_bounds)
+        return lower_bounds
+
+    @property
+    def flowmc_upper_bounds(self):
+        """Determine the upper bounds for the model"""
+        assert self.flowmc, "Cannot get upper bounds of flowmc model when using pymc"
+        nmodes = self.model_input["f_coeffs"].shape[0]
+        upper_bounds = []
+        upper_bounds.append(self.model_input["M_max"])
+        upper_bounds.append(self.model_input["chi_max"])
+        upper_bounds += (
+            [10] * 4 * nmodes
+        )  # A unit maxima, hopefully a sufficiently low number
+        # Will that always be true in flat A and flat A/ellip?
+        upper_bounds += [self.model_input["df_max"]] * nmodes
+        upper_bounds += [self.model_input["dtau_max"]] * nmodes
+        upper_bounds = jnp.array(upper_bounds)
+        return upper_bounds
+
+    def flowmc_get_best_fit(
+        self, set_nwalkers: int = 100, n_loops: int = 2000, seed=92348
+    ) -> Array:
+        # Based on the Jim function `jimgw.Jim.maximize_likelihood`
+        # Get bounds for optimizing start location
+        bounds = jnp.vstack((self.flowmc_lower_bounds, self.flowmc_upper_bounds)).T
+        key = jax.random.PRNGKey(seed)
+        set_nwalkers = set_nwalkers
+        initial_guess = jax.random.uniform(
+            key,
+            shape=(set_nwalkers, self.flowmc_lower_bounds.shape[0]),
+            minval=self.flowmc_lower_bounds,
+            maxval=self.flowmc_upper_bounds,
+        )
+        print(bounds.shape)
+
+        y = lambda x: -self.flowmc_model(x)
+        y = jax.jit(jax.vmap(y))
+        print("Compiling likelihood function")
+        y(initial_guess)
+        print("Done compiling")
+
+        print("Starting the optimizer")
+        optimizer = EvolutionaryOptimizer(
+            self.flowmc_lower_bounds.shape[0], verbose=True
+        )
+        state = optimizer.optimize(y, bounds, n_loops=n_loops)
+        best_fit = optimizer.get_result()[0]
+        return best_fit
+
+    def _flowmc_annotate_results(self):
+        """Once chains have been computed, """
+
+    def run(
+        self,
+        prior=False,
+        suppress_warnings=True,
+        store_residuals=True,
+        min_ess=None,
+        **kws,
+    ):
         """Fit model.
 
         Additional keyword arguments not listed below are passed to the sampler,
@@ -723,7 +876,7 @@ class Fit(object):
         \*\*kws :
             arguments passed to sampler.
         """
-        ess_run = -1.0 #ess after sampling finishes, to be set by loop below
+        ess_run = -1.0  # ess after sampling finishes, to be set by loop below
         if min_ess is None:
             min_ess = 0.0
 
@@ -735,59 +888,139 @@ class Fit(object):
         for ifo in self.ifos:
             if not np.isclose(self.acfs[ifo].delta_t, self.data[ifo].delta_t):
                 e = "{} ACF delta_t ({:.1e}) does not match data ({:.1e})."
-                raise AssertionError(e.format(ifo, self.acfs[ifo].delta_t,
-                                          self.data[ifo].delta_t))
+                raise AssertionError(
+                    e.format(ifo, self.acfs[ifo].delta_t, self.data[ifo].delta_t)
+                )
 
         # parse keyword arguments
-        filter = 'ignore' if suppress_warnings else 'default'
+        filter = "ignore" if suppress_warnings else "default"
 
         # run keyword arguments
         rkws = cp.deepcopy(self.DEF_RUN_KWS)
         rkws.update(kws)
 
         # run model and store
-        logging.info('running {} (prior = {})'.format(self.model, prior))
+        logging.info("running {} (prior = {})".format(self.model, prior))
         with warnings.catch_warnings():
             warnings.simplefilter(filter)
             self.update_prior(prior_run=prior)
-            with self.pymc_model:
-                while ess_run < min_ess:
+            if self.flowmc:
+                n_chains = kws.get("n_chains", 100)
+                rng_key_set = initialize_rng_keys(n_chains, seed=42) 
+                n_dim = self.flowmc_lower_bounds.shape[0]
 
-                    if not np.isscalar(min_ess):
-                        raise ValueError("min_ess is not a number")
+                step_size = 2e-2
+                mass_matrix = jnp.eye(n_dim) * step_size
+                # Mass varies on a scale an order of magnitude greater
+                # Than the other variables
+                mass_matrix = mass_matrix.at[0, 0].set(2e-1)
+                # Chi forms a very broad distribution
+                mass_matrix = mass_matrix.at[1,1].set(1e-2)
+                # df and dtau should have very small scales
+                # for ii in range(self.n_modes):
+                #     # df
+                #     mass_matrix = mass_matrix.at[2 + 4 * self.n_modes + ii, 2 + 4 * self.n_modes + ii].set(1e-2)
+                #     # dtau
+                #     mass_matrix = mass_matrix.at[2 + 4 * self.n_modes + ii, 2 + 4 * self.n_modes + ii].set(1e-2)
 
-                    result = pm.sample(**rkws)
-                    if prior:
-                        self.prior = az.convert_to_inference_data(result)
-                        ess = az.ess(self.prior)
-                    else:
-                        self.result = az.convert_to_inference_data(result)
-                        ess = az.ess(self.result)
-                    mess = ess.min()
-                    mess_arr = np.array([mess[k].values[()] for k in mess.keys()])
-                    ess_run = np.min(mess_arr)
-                    if ess_run < min_ess:
-                        tune = 2*kws.get('tune', 1000)
-                        draws = 2*kws.get('draws', 1000)
-                            
-                        logging.warning(f'min ess = {ess_run:.1f} below threshold {min_ess}')
-                        logging.warning(f'fitting again with {tune} tuning steps and {draws} samples')
+                flowmc_rkws = dict(
+                    n_local_steps=200,
+                    n_global_steps=200,
+                    n_epochs=30,
+                    learning_rate=1e-2,
+                    batch_size=10000,
+                    n_loop_training=100,
+                    n_loop_production=10,
+                    n_chains=n_chains,
+                    local_sampler_args = dict(step_size=mass_matrix),
+                    output_thinning=10
+                )
+                flowmc_rkws.update(kws)
 
-                        kws['tune'] = tune
-                        kws['draws'] = draws
-                        rkws.update(kws)
+                # Is this appropriate? Raises the question of what the optimizer is doing in Jim
 
-        if self.model == 'mchi_marginal' and not prior:
-            # This model doesn't have observables because of its structure, so we have to add them in later
-            od_dict = {}
-            for ifo in self.ifos:
-                if isinstance(ifo, bytes):
-                    ifo = ifo.decode('utf-8')
-                od_dict[f'strain_{ifo}'] = self.analysis_data[ifo]
-            self.result.add_groups(dict(observed_data=dict_to_dataset(od_dict, coords=self.result.posterior.coords, dims={k: ['time_index'] for k in od_dict.keys()}, default_dims=[])))
+                initial_guess = jax.random.uniform(
+                    rng_key_set[0],
+                    shape=(flowmc_rkws['n_chains'], n_dim),
+                    minval=self.flowmc_lower_bounds,
+                    maxval=self.flowmc_upper_bounds
+                )
 
-        if not prior and store_residuals:
-            self._generate_whitened_residuals()
+                # Default flowmc settings - probably not good enough but somewhere to start
+                # Follow Jim to crank up settings as necessary
+
+                
+                model = MaskedCouplingRQSpline(
+                    n_dim, 3, [64, 64], 8, jax.random.PRNGKey(21)
+                )
+                local_sampler = MALA(
+                    self.flowmc_model, True, flowmc_rkws['local_sampler_args']
+                )
+
+                nf_sampler = Sampler(
+                    n_dim,
+                    rng_key_set,
+                    jnp.arange(n_dim),
+                    local_sampler,
+                    model,
+                    **flowmc_rkws
+                )
+
+                nf_sampler.sample(initial_guess, None)
+                self.chains, self.logp, self.local_accs, self.global_accs = nf_sampler.get_sampler_state().values()
+
+            else:
+                with self.pymc_model:
+                    while ess_run < min_ess:
+                        if not np.isscalar(min_ess):
+                            raise ValueError("min_ess is not a number")
+
+                        result = pm.sample(**rkws)
+                        if prior:
+                            self.prior = az.convert_to_inference_data(result)
+                            ess = az.ess(self.prior)
+                        else:
+                            self.result = az.convert_to_inference_data(result)
+                            ess = az.ess(self.result)
+                        mess = ess.min()
+                        mess_arr = np.array([mess[k].values[()] for k in mess.keys()])
+                        ess_run = np.min(mess_arr)
+                        if ess_run < min_ess:
+                            tune = 2 * kws.get("tune", 1000)
+                            draws = 2 * kws.get("draws", 1000)
+
+                            logging.warning(
+                                f"min ess = {ess_run:.1f} below threshold {min_ess}"
+                            )
+                            logging.warning(
+                                f"fitting again with {tune} tuning steps and {draws} samples"
+                            )
+
+                            kws["tune"] = tune
+                            kws["draws"] = draws
+                            rkws.update(kws)
+
+                if self.model == "mchi_marginal" and not prior:
+                    # This model doesn't have observables because of its structure, so we have to add them in later
+                    od_dict = {}
+                    for ifo in self.ifos:
+                        if isinstance(ifo, bytes):
+                            ifo = ifo.decode("utf-8")
+                        od_dict[f"strain_{ifo}"] = self.analysis_data[ifo]
+                    self.result.add_groups(
+                        dict(
+                            observed_data=dict_to_dataset(
+                                od_dict,
+                                coords=self.result.posterior.coords,
+                                dims={k: ["time_index"] for k in od_dict.keys()},
+                                default_dims=[],
+                            )
+                        )
+                    )
+
+                if not prior and store_residuals:
+                    self._generate_whitened_residuals()
+
     run.__doc__ = run.__doc__.format(DEF_RUN_KWS)
 
     def _generate_whitened_residuals(self):
@@ -797,34 +1030,58 @@ class Fit(object):
         for ifo in self.ifos:
             if ifo in self.result.posterior.ifo:
                 ifo_key = ifo
-            elif bytes(str(ifo), 'utf-8') in self.result.posterior.ifo:
+            elif bytes(str(ifo), "utf-8") in self.result.posterior.ifo:
                 # IFO coordinates are bytestrings
-                ifo_key = bytes(str(ifo), 'utf-8') # IFO coordinates are bytestrings
+                ifo_key = bytes(str(ifo), "utf-8")  # IFO coordinates are bytestrings
             else:
-                raise KeyError(f"IFO {ifo} is not a valid indexing ifo for the result posterior")
-            r = self.result.observed_data[f'strain_{ifo}'] -\
-                self.result.posterior.h_det.loc[:,:,ifo_key,:]
-            residuals[ifo] = r.transpose('chain', 'draw', 'time_index')
-            residuals_stacked[ifo] = residuals[ifo].stack(sample=['chain',
-                                                                  'draw'])
+                raise KeyError(
+                    f"IFO {ifo} is not a valid indexing ifo for the result posterior"
+                )
+            r = (
+                self.result.observed_data[f"strain_{ifo}"]
+                - self.result.posterior.h_det.loc[:, :, ifo_key, :]
+            )
+            residuals[ifo] = r.transpose("chain", "draw", "time_index")
+            residuals_stacked[ifo] = residuals[ifo].stack(sample=["chain", "draw"])
         residuals_whitened = self.whiten(residuals_stacked)
         d = self.result.posterior.dims
         residuals_whitened = {
-            i: v.reshape((d['time_index'], d['chain'], d['draw']))
-            for i,v in residuals_whitened.items()
+            i: v.reshape((d["time_index"], d["chain"], d["draw"]))
+            for i, v in residuals_whitened.items()
         }
         resid = np.stack([residuals_whitened[i] for i in self.ifos], axis=-1)
-        keys = ('time_index', 'chain', 'draw', 'ifo')
-        self.result.posterior['whitened_residual'] = (keys, resid)
-        keys = ('chain', 'draw', 'ifo', 'time_index')
-        self.result.posterior['whitened_residual'] = \
-            self.result.posterior.whitened_residual.transpose(*keys)
+        keys = ("time_index", "chain", "draw", "ifo")
+        self.result.posterior["whitened_residual"] = (keys, resid)
+        keys = ("chain", "draw", "ifo", "time_index")
+        self.result.posterior[
+            "whitened_residual"
+        ] = self.result.posterior.whitened_residual.transpose(*keys)
         try:
-            self.result.log_likelihood['whitened_pointwise_loglike'] =\
-                -self.result.posterior.whitened_residual**2/2
+            self.result.log_likelihood["whitened_pointwise_loglike"] = (
+                -self.result.posterior.whitened_residual**2 / 2
+            )
         except AttributeError:
             # We assume that log-likelihood isn't created yet.
-            self.result.add_groups(dict(log_likelihood=dict_to_dataset({'whitened_pointwise_loglike': -self.result.posterior.whitened_residual**2/2}, coords=self.result.posterior.coords, dims={'whitened_pointwise_loglike': ['chain', 'draw', 'ifo', 'time_index']})))
+            self.result.add_groups(
+                dict(
+                    log_likelihood=dict_to_dataset(
+                        {
+                            "whitened_pointwise_loglike": -self.result.posterior.whitened_residual
+                            ** 2
+                            / 2
+                        },
+                        coords=self.result.posterior.coords,
+                        dims={
+                            "whitened_pointwise_loglike": [
+                                "chain",
+                                "draw",
+                                "ifo",
+                                "time_index",
+                            ]
+                        },
+                    )
+                )
+            )
 
     def add_data(self, data, time=None, ifo=None, acf=None):
         """Add data to fit.
@@ -842,7 +1099,7 @@ class Fit(object):
             autocovariance series corresponding to these data (optional).
         """
         if not isinstance(data, Data):
-            data = Data(data, index=getattr(data, 'time', time), ifo=ifo)
+            data = Data(data, index=getattr(data, "time", time), ifo=ifo)
         self.data[data.ifo] = data
         if acf is not None:
             self.acfs[data.ifo] = acf
@@ -863,24 +1120,24 @@ class Fit(object):
             `H1` for LIGO Hanford).
 
         ifos : list
-            list of detector keys (e.g., ``['H1', 'L1']``), not required 
+            list of detector keys (e.g., ``['H1', 'L1']``), not required
             if `path_input` is a dictionary.
         """
         # TODO: add ability to generate synthetic data here?
         if isinstance(path_input, str):
             try:
                 path_dict = literal_eval(path_input)
-            except (ValueError,SyntaxError):
+            except (ValueError, SyntaxError):
                 if ifos is None:
                     raise ValueError("must provide IFO list.")
                 path_dict = {}
                 for ifo in ifos:
-                    i = '' if not ifo else ifo[0]
+                    i = "" if not ifo else ifo[0]
                     path_dict[ifo] = path_input.format(i=i, ifo=ifo)
         else:
             path_dict = path_input
-        path_dict = {k: os.path.abspath(v) for k,v in path_dict.items()}
-        tslide = kws.pop('slide', {}) or {}
+        path_dict = {k: os.path.abspath(v) for k, v in path_dict.items()}
+        tslide = kws.pop("slide", {}) or {}
         for ifo, path in path_dict.items():
             self.add_data(Data.read(path, ifo=ifo, **kws))
         # apply time slide if requested
@@ -889,8 +1146,8 @@ class Fit(object):
             new_d = Data(np.roll(d, int(dt / d.delta_t)), ifo=i, index=d.time)
             self.add_data(new_d)
         # record data provenance
-        self.update_info('data', path=path_dict, **kws)
-    
+        self.update_info("data", path=path_dict, **kws)
+
     def compute_acfs(self, shared=False, ifos=None, **kws):
         """Compute ACFs for all data sets in `Fit.data`.
 
@@ -913,17 +1170,17 @@ class Fit(object):
 
         # Try to set a safe `nperseg` if we are using `fd` estimation
         if self.n_analyze is not None:
-            nperseg_safe = np2(16*self.n_analyze)
-            if kws.get('method', 'fd') == 'fd':
-                if not ('nperseg' in kws):
-                    kws['nperseg'] = nperseg_safe
-        
+            nperseg_safe = np2(16 * self.n_analyze)
+            if kws.get("method", "fd") == "fd":
+                if not ("nperseg" in kws):
+                    kws["nperseg"] = nperseg_safe
+
         # if shared, compute a single ACF
         acf = self.data[ifos[0]].get_acf(**kws) if shared else None
         for ifo in ifos:
             self.acfs[ifo] = acf if shared else self.data[ifo].get_acf(**kws)
         # record ACF computation options
-        self.update_info('acf', shared=shared, **kws)
+        self.update_info("acf", shared=shared, **kws)
 
     def load_acfs(self, path_input, ifos=None, from_psd=False, **kws):
         """Load autocovariances from disk. Can read in a PSD, instead of an
@@ -943,36 +1200,36 @@ class Fit(object):
             listed in `ifos` (e.g., `H` and `H1` for LIGO Hanford).
 
         ifos : list
-            list of detector keys (e.g., ``['H1', 'L1']``), not required 
+            list of detector keys (e.g., ``['H1', 'L1']``), not required
             if `path_input` is a dictionary.
 
         from_psd : bool
             read in a PSD and convert to ACF.
         """
-        kws['header'] = kws.get('header', None)
+        kws["header"] = kws.get("header", None)
         if isinstance(path_input, str):
             try:
                 path_dict = literal_eval(path_input)
-            except (ValueError,SyntaxError):
+            except (ValueError, SyntaxError):
                 if ifos is None:
-                    ifos = self.ifos 
+                    ifos = self.ifos
                 path_dict = {}
                 for ifo in ifos:
-                    i = '' if not ifo else ifo[0]
+                    i = "" if not ifo else ifo[0]
                     path_dict[ifo] = path_input.format(i=i, ifo=ifo)
         else:
             path_dict = path_input
-        path_dict = {k: os.path.abspath(v) for k,v in path_dict.items()}
+        path_dict = {k: os.path.abspath(v) for k, v in path_dict.items()}
         for ifo, p in path_dict.items():
             if from_psd:
                 self.acfs[ifo] = PowerSpectrum.read(p, **kws).to_acf()
             else:
                 self.acfs[ifo] = AutoCovariance.read(p, **kws)
         # record ACF computation options
-        self.update_info('acf', path=path_dict, from_psd=from_psd, **kws)
+        self.update_info("acf", path=path_dict, from_psd=from_psd, **kws)
 
     def set_tone_sequence(self, nmode, p=1, s=-2, l=2, m=2):
-        """ Set template modes to be a sequence of overtones with a given
+        """Set template modes to be a sequence of overtones with a given
         angular structure.
 
         To set an arbitrary set of modes, use :meth:`Fit.set_modes`
@@ -994,7 +1251,7 @@ class Fit(object):
         self.set_modes(indexes)
 
     def set_modes(self, modes):
-        """ Establish list of modes to include in analysis template.
+        """Establish list of modes to include in analysis template.
 
         Modes identified by their `(p, s, l, m, n)` indices, where:
           - `p` is `1` for prograde modes, and `-1` for retrograde modes;
@@ -1018,20 +1275,29 @@ class Fit(object):
             # otherwise, assume it is a mode index list
             self._n_modes = None
             self.modes = qnms.construct_mode_list(modes)
-            if self.model == 'mchi_aligned':
+            if self.model == "mchi_aligned":
                 ls_valid = [mode.l == 2 for mode in self.modes]
                 ms_valid = [abs(mode.m) == 2 for mode in self.modes]
                 if not (all(ls_valid) and all(ms_valid)):
                     raise ValueError("mchi_aligned model only accepts l=m=2 modes")
 
-    def set_target(self, t0, ra=None, dec=None, psi=None, delays=None,
-                   antenna_patterns=None, duration=None, n_analyze=None):
-        """ Establish truncation target, stored to `self.target`.
+    def set_target(
+        self,
+        t0,
+        ra=None,
+        dec=None,
+        psi=None,
+        delays=None,
+        antenna_patterns=None,
+        duration=None,
+        n_analyze=None,
+    ):
+        """Establish truncation target, stored to `self.target`.
 
         Provide a targetted analysis start time `t0` to serve as beginning of
         truncated analysis segment; this will be compared against timestamps
         in `fit.data` objects so that the closest sample to `t0` is preserved
-        after conditioning and taken as the first sample of the analysis 
+        after conditioning and taken as the first sample of the analysis
         segment.
 
         .. important::
@@ -1041,14 +1307,14 @@ class Fit(object):
 
         The source sky location and orientation can be specified by the `ra`,
         `dec`, and `psi` arguments. These are use to both determine the
-        truncation time at different detectors, as well as to compute the 
+        truncation time at different detectors, as well as to compute the
         corresponding antenna patterns. Specifying a sky location is only
         required if the model can handle data from multiple detectors.
 
         Alternatively, antenna patterns and geocenter-delays can be specified
         directly through the `antenna_patterns` and `delays` arguments.
 
-        For all models, the argument `duration` specifies the length of the 
+        For all models, the argument `duration` specifies the length of the
         analysis segment in the unit of time used to index the data (e.g., s).
         Based on the sampling rate, this argument is used to compute the number
         of samples to be included in the segment, beginning from the first
@@ -1093,15 +1359,17 @@ class Fit(object):
         antenna_patterns = antenna_patterns or {}
         for ifo, data in self.data.items():
             # TODO: should we have an elliptical+ftau model?
-            if ifo is None or self.model=='ftau':
+            if ifo is None or self.model == "ftau":
                 dt_ifo = 0
                 self.antenna_patterns[ifo] = (1, 1)
             else:
                 det = data.detector
-                dt_ifo = delays.get(ifo,
-                    lal.TimeDelayFromEarthCenter(det.location, ra, dec, tgps))
-                self.antenna_patterns[ifo] = antenna_patterns.get(ifo,
-                    lal.ComputeDetAMResponse(det.response, ra, dec, psi, gmst))
+                dt_ifo = delays.get(
+                    ifo, lal.TimeDelayFromEarthCenter(det.location, ra, dec, tgps)
+                )
+                self.antenna_patterns[ifo] = antenna_patterns.get(
+                    ifo, lal.ComputeDetAMResponse(det.response, ra, dec, psi, gmst)
+                )
             self.start_times[ifo] = t0 + dt_ifo
         self.target = Target(t0, ra, dec, psi)
         # also specify analysis duration if requested
@@ -1115,14 +1383,14 @@ class Fit(object):
                 raise ValueError("{} start time not in data".format(i))
 
     def update_target(self, **kws):
-        """Modify analysis target. See also :meth:`Fit.set_target`.
-        """
+        """Modify analysis target. See also :meth:`Fit.set_target`."""
         if self.result is not None:
             # TODO: fail?
             logging.warn("updating target of Fit with preexisting results!")
         target = self.target._asdict()
-        target.update({k: getattr(self,k) for k in
-                       ['duration', 'n_analyze', 'antenna_patterns']})
+        target.update(
+            {k: getattr(self, k) for k in ["duration", "n_analyze", "antenna_patterns"]}
+        )
         target.update(kws)
         self.set_target(**target)
 
@@ -1137,10 +1405,12 @@ class Fit(object):
         """
         if self._n_analyze and not self._duration:
             if self.data:
-                return self._n_analyze*self.data[self.ifos[0]].delta_t
+                return self._n_analyze * self.data[self.ifos[0]].delta_t
             else:
-                logging.warning("add data to compute duration "
-                                "(n_analyze = {})".format(self._n_analyze))
+                logging.warning(
+                    "add data to compute duration "
+                    "(n_analyze = {})".format(self._n_analyze)
+                )
                 return None
         else:
             return self._duration
@@ -1171,21 +1441,22 @@ class Fit(object):
 
     @property
     def n_analyze(self) -> int:
-        """Number of data points included in analysis for each detector.
-        """
+        """Number of data points included in analysis for each detector."""
         if self._duration and not self._n_analyze:
             # set n_analyze based on specified duration in seconds
             if self.data:
                 dt = self.data[self.ifos[0]].delta_t
-                return int(round(self._duration/dt))
+                return int(round(self._duration / dt))
             else:
-                logging.warning("add data to compute n_analyze "
-                                "(duration = {})".format(self._duration))
+                logging.warning(
+                    "add data to compute n_analyze "
+                    "(duration = {})".format(self._duration)
+                )
                 return None
         elif self.data and self.has_target:
             # set n_analyze to fit shortest data set
             i0s = self.start_indices
-            return min([len(d.iloc[i0s[i]:]) for i, d in self.data.items()])
+            return min([len(d.iloc[i0s[i] :]) for i, d in self.data.items()])
         else:
             return self._n_analyze
 
@@ -1205,8 +1476,7 @@ class Fit(object):
             dictionary of :class:`ringdown.data.Data` with whitned data for
             each detector.
         """
-        return {i: self.acfs[i].whiten(d)
-                for i,d in datas.items()}
+        return {i: self.acfs[i].whiten(d) for i, d in datas.items()}
 
     def draw_sample(self, map=False, prior=False, rng=None, seed=None):
         """Draw a sample from the posterior.
@@ -1215,14 +1485,14 @@ class Fit(object):
         ---------
         map : bool
            return maximum-probability sample; otherwise, returns random draw
-           (def., `False`) 
+           (def., `False`)
         prior : bool
             draw from prior instead of posterior samples
         rng : numpy.random._generator.Generator
             random number generator (optional)
         seed : int
             seed to initialize new random number generator (optional)
-        
+
         Returns
         -------
         i : int
@@ -1237,15 +1507,15 @@ class Fit(object):
             raise ValueError("no posterior samples available")
         # stack samples (prior or result)
         result = self.prior if prior else self.result
-        samples = result.posterior.stack(sample=('chain', 'draw'))
+        samples = result.posterior.stack(sample=("chain", "draw"))
         if map:
             # select maximum probability sample
-            logp = result.sample_stats.lp.stack(sample=('chain', 'draw'))
+            logp = result.sample_stats.lp.stack(sample=("chain", "draw"))
             i = np.argmax(logp.values)
         else:
             # pick random sample
             rng = rng or np.random.default_rng(seed)
-            i = rng.integers(len(samples['sample']))
+            i = rng.integers(len(samples["sample"]))
         sample = samples.isel(sample=i)
         pars = sample.data_vars
         return i, pars
@@ -1266,7 +1536,7 @@ class Fit(object):
             return None
         # get reconstructions from posterior, shaped as (chain, draw, ifo, time)
         # and stack into (ifo, time, sample)
-        hs = self.result.posterior.h_det.stack(samples=('chain', 'draw'))
+        hs = self.result.posterior.h_det.stack(samples=("chain", "draw"))
         # whiten the reconstructions using the Cholesky factors, L, with shape
         # (ifo, time, time). the resulting object will have shape (ifo, time, sample)
         return linalg.solve(self.result.constant_data.L, hs)
@@ -1317,7 +1587,7 @@ class Fit(object):
             # whiten it with the Cholesky factors, so shape will remain (ifo, time)
             wds = linalg.solve(self.result.constant_data.L, ds)
             # take inner product between whitened template and data, and normalize
-            snrs = einsum('ijk,ij->ik', whs, wds)/opt_ifo_snrs
+            snrs = einsum("ijk,ij->ik", whs, wds) / opt_ifo_snrs
         if network:
             # take norm across detectors
             return linalg.norm(snrs, axis=0)
@@ -1328,17 +1598,17 @@ class Fit(object):
     def waic(self):
         """Returns the 'widely applicable information criterion' predictive
         accuarcy metric for the fit.
-        
+
         See https://arxiv.org/abs/1507.04544 for definitions and discussion.  A
         larger WAIC indicates that the model has better predictive accuarcy on
         the fitted data set."""
-        return az.waic(self.result, var_name='whitened_pointwise_loglike')
-    
+        return az.waic(self.result, var_name="whitened_pointwise_loglike")
+
     @property
     def loo(self):
         """Returns a leave-one-out estimate of the predictive accuracy of the
         model.
-        
+
         See https://arxiv.org/abs/1507.04544 for definitions and discussion,
         including discussion of the 'Pareto stabilization' algorithm for
         reducing the variance of the leave-one-out estimate.  The LOO is an
@@ -1346,4 +1616,4 @@ class Fit(object):
         evaluated on hypothetical data from a replication of the observation
         averaged over the posterior) of the model; larger LOO values indicate
         higher predictive accuracy (i.e. explanatory power) for the model."""
-        return az.loo(self.result, var_name='whitened_pointwise_loglike')
+        return az.loo(self.result, var_name="whitened_pointwise_loglike")
